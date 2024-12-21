@@ -5,6 +5,7 @@ import logging
 from aiogram import Bot, Dispatcher
 from config_test import TG_TOKEN
 from database import init_db
+from handlers.admin_handlers import admin_router
 from handlers.user_handlers import user_router
 
 # Инициализация логирования
@@ -16,6 +17,7 @@ bot = Bot(token=TG_TOKEN)
 dp = Dispatcher()
 
 # Регистрируем роутеры, в которых содержатся наши хендлеры
+dp.include_router(admin_router)
 dp.include_router(user_router)
 
 async def main():

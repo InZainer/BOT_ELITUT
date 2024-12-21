@@ -1,10 +1,9 @@
 # handlers/user_handlers.py
 
-from aiogram import types, Router, F, Bot
+from aiogram import types, Router, F
 from aiogram.types import ReplyKeyboardMarkup, KeyboardButton, FSInputFile
 from aiogram.filters import Command
 from database import add_user
-from utils.content_manager import load_content
 from utils.validation import validate_code
 from handlers.main_helpers import is_admin, user_data
 from handlers.main_menu import (

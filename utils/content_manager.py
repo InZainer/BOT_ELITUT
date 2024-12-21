@@ -6,6 +6,8 @@ import os
 CONTENT_FILE = 'content.json'
 
 def load_content():
+    if not os.path.exists(CONTENT_FILE):
+        return {}
     with open(CONTENT_FILE, 'r', encoding='utf-8') as f:
         return json.load(f)
 
