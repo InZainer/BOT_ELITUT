@@ -27,6 +27,10 @@ class AuthStates(StatesGroup):
     waiting_for_code = State()
     waiting_for_photo = State()  # Admin waiting for photo upload
 
+class ConciergeStates(StatesGroup):
+    waiting_for_message = State()  # User is in concierge mode, waiting for message
+    waiting_for_media = State()    # User can send additional media to their message
+
 # Basic logging
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s %(message)s")
 logger = logging.getLogger("house-bots")
@@ -203,7 +207,199 @@ async def send_content_with_photo(cb: CallbackQuery, db: Database, content_path:
         await cb.answer("Ошибка при отправке контента", show_alert=True)
 
 
-async def callback_router(cb: CallbackQuery, db: Database):
+# Concierge functions
+async def handle_concierge_start(cb: CallbackQuery, state: FSMContext):
+    """Start concierge conversation with proper state management"""
+    user_id = cb.from_user.id
+    house = loader.load_house(HOUSE_ID)
+    
+    # Set concierge state
+    await state.set_state(ConciergeStates.waiting_for_message)
+    
+    # Get concierge text from config or use default
+    text = (house.concierge_text if house and house.concierge_text else 
+            "Вы в режиме консьержа. Напишите ваш вопрос или просьбу.")
+    
+    # Create concierge keyboard
+    concierge_kb = InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="❌ Отменить", callback_data="concierge_cancel")],
+        [InlineKeyboardButton(text="⬅️ В главное меню", callback_data="back_main")]
+    ])
+    
+    await cb.message.answer(
+        f"🏨 **Режим консьержа активирован**\n\n"
+        f"{text}\n\n"
+        f"📝 **Отправьте ваше сообщение одним или несколькими сообщениями**\n"
+        f"📷 При необходимости прикрепите фото или видео\n\n"
+        f"⏰ Режим работы: 9:00 - 21:00\n"
+        f"💬 Все сообщения будут переданы администратору",
+        reply_markup=concierge_kb
+    )
+    await cb.message.delete()
+    await cb.answer()
+    
+    logger.info(f"User {user_id} entered concierge mode")
+
+
+async def handle_concierge_message(message: Message, state: FSMContext, db: Database):
+    """Handle message in concierge mode"""
+    user = message.from_user
+    text = message.text or ""
+    
+    logger.info(f"Processing concierge message from user {user.id}: {text[:50]}...")
+    
+    # Send message to admins
+    if ADMIN_IDS:
+        try:
+            user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
+            if user.first_name:
+                user_info = f"{user.first_name} ({user_info})"
+            
+            payload = f"🏨 Сообщение консьержу\n\n"\
+                     f"👤 От: {user_info}\n"\
+                     f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}\n\n"\
+                     f"💬 Сообщение:\n{text}"
+            
+            # Send to all admins with reply button
+            admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✉️ Ответить", callback_data=f"admin_reply:{user.id}")]
+            ])
+            
+            success_count = 0
+            for admin_id in ADMIN_IDS:
+                try:
+                    await message.bot.send_message(
+                        admin_id, payload,
+                        parse_mode=None,  # Отключаем парсинг Markdown для безопасности
+                        reply_markup=admin_kb
+                    )
+                    success_count += 1
+                    logger.info(f"Successfully sent concierge message to admin {admin_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send concierge message to admin {admin_id}: {e}")
+            
+            if success_count > 0:
+                # Confirm to user
+                await message.answer(
+                    f"✅ **Сообщение отправлено администратору!**\n\n"
+                    f"📧 Ваше сообщение передано {success_count} администратору(ам)\n"
+                    f"⏱️ Ожидайте ответа в рабочее время (9:00-21:00)\n\n"
+                    f"💡 Вы можете отправить дополнительные сообщения или медиафайлы",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📱 Завершить диалог", callback_data="concierge_finish")],
+                        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_main")]
+                    ])
+                )
+                # Keep user in concierge mode for additional messages
+                await state.set_state(ConciergeStates.waiting_for_media)
+            else:
+                await message.answer(
+                    "❌ **Ошибка отправки сообщения**\n\n"
+                    "К сожалению, не удалось доставить сообщение администраторам. "
+                    "Попробуйте позже или обратитесь через другие каналы связи.",
+                    reply_markup=back_kb()
+                )
+                await state.clear()
+        except Exception as e:
+            logger.exception("Failed to process concierge message: %s", e)
+            await message.answer(
+                "❌ Произошла ошибка при отправке сообщения. Попробуйте позже.",
+                reply_markup=back_kb()
+            )
+            await state.clear()
+    else:
+        await message.answer(
+            "⚠️ Администраторы сейчас недоступны. Попробуйте позже.",
+            reply_markup=back_kb()
+        )
+        await state.clear()
+
+
+async def handle_concierge_media(message: Message, state: FSMContext):
+    """Handle media in concierge mode"""
+    user = message.from_user
+    
+    logger.info(f"Processing concierge media from user {user.id}")
+    
+    if ADMIN_IDS:
+        try:
+            user_info = f"@{user.username}" if user.username else f"ID: {user.id}"
+            if user.first_name:
+                user_info = f"{user.first_name} ({user_info})"
+            
+            caption = f"🏨 **Медиафайл от консьержа**\n\n"\
+                     f"👤 От: {user_info}\n"\
+                     f"⏰ Время: {datetime.now().strftime('%H:%M:%S')}"
+            
+            if message.caption:
+                caption += f"\n\n📝 **Описание:**\n{message.caption}"
+            
+            # Admin keyboard
+            admin_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="✉️ Ответить", callback_data=f"admin_reply:{user.id}")]
+            ])
+            
+            success_count = 0
+            for admin_id in ADMIN_IDS:
+                try:
+                    if message.photo:
+                        await message.bot.send_photo(
+                            admin_id, message.photo[-1].file_id,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=admin_kb
+                        )
+                    elif message.video:
+                        await message.bot.send_video(
+                            admin_id, message.video.file_id,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=admin_kb
+                        )
+                    elif message.document:
+                        await message.bot.send_document(
+                            admin_id, message.document.file_id,
+                            caption=caption,
+                            parse_mode=ParseMode.MARKDOWN,
+                            reply_markup=admin_kb
+                        )
+                    success_count += 1
+                    logger.info(f"Successfully sent concierge media to admin {admin_id}")
+                except Exception as e:
+                    logger.error(f"Failed to send concierge media to admin {admin_id}: {e}")
+            
+            if success_count > 0:
+                await message.answer(
+                    f"✅ **Медиафайл отправлен!**\n\n"
+                    f"📧 Файл передан {success_count} администратору(ам)\n"
+                    f"💡 Можете отправить еще сообщения или завершить диалог",
+                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                        [InlineKeyboardButton(text="📱 Завершить диалог", callback_data="concierge_finish")],
+                        [InlineKeyboardButton(text="⬅️ В меню", callback_data="back_main")]
+                    ])
+                )
+            else:
+                await message.answer(
+                    "❌ Ошибка при отправке медиафайла. Попробуйте позже.",
+                    reply_markup=back_kb()
+                )
+                await state.clear()
+        except Exception as e:
+            logger.exception("Failed to process concierge media: %s", e)
+            await message.answer(
+                "❌ Произошла ошибка. Попробуйте позже.",
+                reply_markup=back_kb()
+            )
+            await state.clear()
+    else:
+        await message.answer(
+            "⚠️ Администраторы недоступны.",
+            reply_markup=back_kb()
+        )
+        await state.clear()
+
+
+async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
     data = cb.data or ""
     house = loader.load_house(HOUSE_ID)
 
@@ -250,8 +446,21 @@ async def callback_router(cb: CallbackQuery, db: Database):
         return
 
     if data == "concierge":
-        text = (house.concierge_text if house and house.concierge_text else "Напишите ваш вопрос. Я перешлю администратору.")
-        await cb.message.answer(text + "\n\nОтправьте ваш вопрос одним сообщением.\n\n📷 Вы также можете прикрепить фото или видео к вашему вопросу, отправив их отдельным сообщением.", reply_markup=back_kb())
+        # Start concierge conversation with FSM state
+        await handle_concierge_start(cb, state)
+        return
+    
+    # Concierge callbacks
+    if data == "concierge_cancel":
+        await state.clear()
+        await cb.message.answer("❌ Режим консьержа отменен.", reply_markup=main_menu_kb())
+        await cb.message.delete()
+        await cb.answer()
+        return
+    
+    if data == "concierge_finish":
+        await state.clear()
+        await cb.message.answer("📱 **Диалог завершен**\n\nСпасибо за обращение! Возвращайтесь, если понадобится помощь.", reply_markup=main_menu_kb())
         await cb.message.delete()
         await cb.answer()
         return
@@ -359,6 +568,13 @@ async def text_router(message: Message, state: FSMContext, db: Database):
     # If user is in waiting_for_code state, process the code
     if current_state == AuthStates.waiting_for_code.state:
         return await process_code(message, state, db)
+    
+    # If user is in concierge mode, handle the message appropriately
+    if current_state == ConciergeStates.waiting_for_message.state:
+        return await handle_concierge_message(message, state, db)
+    elif current_state == ConciergeStates.waiting_for_media.state:
+        # In this state, user can send additional text messages
+        return await handle_concierge_message(message, state, db)
 
     # Check if user is authorized for normal operations
     profile = await db.get_user(message.from_user.id)
@@ -371,13 +587,24 @@ async def text_router(message: Message, state: FSMContext, db: Database):
         await message.answer("Для доступа к боту введите, пожалуйста, ваш числовой код доступа:")
         return
 
-    # Concierge question: forward to admin
-    if text:
-        prefix = text.lower().strip()
-        is_consent = "разрешаю публикацию" in prefix
-        
+    # Only forward messages that are explicitly concierge questions or feedback
+    # Check if this looks like a concierge question or feedback
+    text_lower = text.lower().strip()
+    
+    # Check for explicit concierge/feedback indicators
+    is_concierge_question = any(keyword in text_lower for keyword in [
+        "вопрос", "помощь", "помогите", "как", "где", "когда", "что", "почему",
+        "консьерж", "консьержу", "администратор", "админу"
+    ])
+    
+    is_feedback = "разрешаю публикацию" in text_lower or any(keyword in text_lower for keyword in [
+        "отзыв", "жалоба", "предложение", "идея", "комментарий", "мнение"
+    ])
+    
+    # Only forward if it's clearly a concierge question or feedback
+    if is_concierge_question or is_feedback:
         # Determine if this is a concierge message or feedback
-        if is_consent:
+        if is_feedback:
             # This is feedback, not concierge
             payload = f"Обратная связь от @{message.from_user.username or message.from_user.id}:\n{text}"
             message_type = "обратной связи"
@@ -390,22 +617,33 @@ async def text_router(message: Message, state: FSMContext, db: Database):
             try:
                 # Send to all admins
                 for admin_id in ADMIN_IDS:
-                    await message.bot.send_message(
-                        admin_id, payload, 
-                        parse_mode=None,  # Disable markdown parsing
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
-                    )
+                    try:
+                        await message.bot.send_message(
+                            admin_id, payload, 
+                            parse_mode=None,  # Disable markdown parsing
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
+                        )
+                        logger.info(f"Successfully sent {message_type} to admin {admin_id}")
+                    except Exception as e:
+                        logger.error(f"Failed to send message to admin {admin_id}: {e}")
+                        # Continue trying other admins
+                        
             except Exception as e:
                 logger.exception("Failed to send admin message: %s", e)
         
         await message.answer(f"Спасибо! Ваше сообщение {message_type} отправлено администратору.\n\n💡 Вы также можете прикрепить фото или видео к вашему вопросу, отправив их отдельным сообщением.")
         # Вернём пользователя в главное меню
         await show_main_menu(message)
+    else:
+        # This is just a regular message, don't forward to admin
+        # Just show the main menu
+        await show_main_menu(message)
 
 
 async def media_router(message: Message):
     # Forward photos/videos to admin
     if ADMIN_IDS:
+        logger.info(f"Forwarding media from user {message.from_user.id} to {len(ADMIN_IDS)} admins: {ADMIN_IDS}")
         try:
             # Create a safe caption without markdown conflicts
             user_info = f"Медиа от @{message.from_user.username or message.from_user.id}"
@@ -417,6 +655,7 @@ async def media_router(message: Message):
                 caption = user_info
             
             # Send to all admins
+            success_count = 0
             for admin_id in ADMIN_IDS:
                 try:
                     if message.photo:
@@ -433,13 +672,22 @@ async def media_router(message: Message):
                             parse_mode=None,  # Disable markdown parsing to avoid conflicts
                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
                         )
+                    success_count += 1
+                    logger.info(f"Successfully sent media to admin {admin_id}")
                 except Exception as e:
                     logger.error(f"Failed to send media to admin {admin_id}: {e}")
+                    # Continue trying other admins
+                    
+            if success_count == 0:
+                logger.error(f"Failed to send media to any admin. All {len(ADMIN_IDS)} attempts failed.")
+            else:
+                logger.info(f"Successfully sent media to {success_count}/{len(ADMIN_IDS)} admins")
                     
         except Exception as e:
             logger.exception("Failed to forward media: %s", e)
             # Try to send without caption if there's still an error
             try:
+                success_count = 0
                 for admin_id in ADMIN_IDS:
                     try:
                         if message.photo:
@@ -455,17 +703,68 @@ async def media_router(message: Message):
                                 caption=f"Видео от @{message.from_user.username or message.from_user.id}",
                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
                             )
+                        success_count += 1
                     except Exception as e2:
                         logger.error(f"Failed to send media to admin {admin_id} even without caption: {e2}")
+                if success_count == 0:
+                    logger.error(f"Failed to send media to any admin even without caption")
             except Exception as e2:
                 logger.exception("Failed to forward media even without caption: {e2}")
+    else:
+        logger.warning("No admin IDs configured, cannot forward media")
     
     await message.answer("Принято! Передал администраторам.")
+
+
+async def check_admin_config():
+    """Check admin configuration and log issues"""
+    logger.info(f"Admin configuration check:")
+    logger.info(f"  ADMIN_IDS_STR: '{ADMIN_IDS_STR}'")
+    logger.info(f"  Parsed ADMIN_IDS: {ADMIN_IDS}")
+    logger.info(f"  ADMIN_CHAT_ID (backward compat): {ADMIN_CHAT_ID}")
+    
+    if not ADMIN_IDS:
+        logger.error("No admin IDs configured! Bot will not be able to forward messages to admins.")
+        logger.error("Please set ADMIN_IDS in your .env file (e.g., ADMIN_IDS=123456789,987654321)")
+        return False
+    
+    # Test if we can send a test message to each admin
+    logger.info("Testing admin message delivery...")
+    from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
+    
+    for admin_id in ADMIN_IDS:
+        try:
+            # Create a temporary bot instance to test message sending
+            test_bot = Bot(BOT_TOKEN)
+            try:
+                # Try to get chat info to verify the admin ID is valid
+                chat = await test_bot.get_chat(admin_id)
+                logger.info(f"✅ Admin {admin_id} is accessible: {chat.type} - {getattr(chat, 'title', getattr(chat, 'username', 'Unknown'))}")
+            except TelegramBadRequest as e:
+                if "chat not found" in str(e).lower():
+                    logger.error(f"❌ Admin {admin_id}: Chat not found - this ID may be invalid or the bot hasn't been started by this user")
+                elif "bot was blocked" in str(e).lower():
+                    logger.error(f"❌ Admin {admin_id}: Bot was blocked by this user")
+                else:
+                    logger.error(f"❌ Admin {admin_id}: Bad request - {e}")
+            except TelegramForbiddenError as e:
+                logger.error(f"❌ Admin {admin_id}: Forbidden - {e}")
+            except Exception as e:
+                logger.error(f"❌ Admin {admin_id}: Unexpected error - {e}")
+            finally:
+                await test_bot.session.close()
+        except Exception as e:
+            logger.error(f"❌ Failed to test admin {admin_id}: {e}")
+    
+    return True
 
 
 async def on_startup(bot: Bot, db: Database):
     logger.info("Bot started for house %s", HOUSE_ID)
     await ensure_db(db)
+    
+    # Check admin configuration
+    await check_admin_config()
 
 
 # Admin: simple content management and reply routing
@@ -695,8 +994,8 @@ async def main():
     async def on_menu(message: Message, state: FSMContext):
         await start_handler(message, state, db)
 
-    async def on_callback(cb: CallbackQuery):
-        await callback_router(cb, db)
+    async def on_callback(cb: CallbackQuery, state: FSMContext):
+        await callback_router(cb, state, db)
 
     async def on_text(message: Message, state: FSMContext):
         await text_router(message, state, db)
@@ -708,12 +1007,17 @@ async def main():
     
     dp.message.register(on_text, F.text)
     
-    async def on_media(message: Message):
+    async def on_media(message: Message, state: FSMContext):
         # Check if admin is uploading photo for content
         if message.from_user and is_admin(message.from_user.id) and message.photo:
             await admin_router(message, db)
         else:
-            await media_router(message)
+            # Check if user is in concierge mode
+            current_state = await state.get_state()
+            if current_state in [ConciergeStates.waiting_for_message.state, ConciergeStates.waiting_for_media.state]:
+                await handle_concierge_media(message, state)
+            else:
+                await media_router(message)
     
     dp.message.register(on_media, F.photo | F.video)
 
