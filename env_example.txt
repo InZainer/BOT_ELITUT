@@ -1,0 +1,20 @@
+# Пример файла .env для нескольких администраторов
+# Скопируйте этот файл в .env и заполните своими данными
+
+# Bot Configuration
+BOT_TOKEN=your_bot_token_here
+
+# Admin Configuration
+# Несколько ID администраторов через запятую (без пробелов)
+ADMIN_IDS=123456789,987654321,555666777
+
+# Альтернатива: Один администратор (для обратной совместимости)
+# ADMIN_CHAT_ID=123456789
+
+# House Configuration
+HOUSE_ID=house1
+AUTH_MODE=code
+ACCESS_DAYS=30
+
+# Database
+DB_PATH=./house-bots.db

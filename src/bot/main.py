@@ -34,11 +34,24 @@ logger = logging.getLogger("house-bots")
 # Globals via env
 load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
-ADMIN_CHAT_ID = int(os.getenv("ADMIN_CHAT_ID", "0") or 0)
+ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")  # Multiple admin IDs separated by comma
 HOUSE_ID = os.getenv("HOUSE_ID", "house1")
 AUTH_MODE = os.getenv("AUTH_MODE", "code")  # code | phone
 ACCESS_DAYS = int(os.getenv("ACCESS_DAYS", "30"))
 DB_PATH = os.getenv("DB_PATH", "./house-bots.db")
+
+# Parse admin IDs
+ADMIN_IDS = []
+if ADMIN_IDS_STR:
+    try:
+        ADMIN_IDS = [int(admin_id.strip()) for admin_id in ADMIN_IDS_STR.split(",") if admin_id.strip()]
+        logger.info(f"Loaded {len(ADMIN_IDS)} admin IDs: {ADMIN_IDS}")
+    except ValueError as e:
+        logger.error(f"Invalid ADMIN_IDS format: {ADMIN_IDS_STR}. Error: {e}")
+        ADMIN_IDS = []
+
+# Keep backward compatibility with old ADMIN_CHAT_ID
+ADMIN_CHAT_ID = ADMIN_IDS[0] if ADMIN_IDS else 0
 
 if not BOT_TOKEN:
     logger.warning("BOT_TOKEN is not set. Fill .env before running in production.")
@@ -56,7 +69,7 @@ async def ensure_db(db: Database):
 # Keyboards
 
 def is_admin(user_id: int) -> bool:
-    return ADMIN_CHAT_ID and user_id == ADMIN_CHAT_ID
+    return user_id in ADMIN_IDS
 
 
 def main_menu_kb():
@@ -373,13 +386,15 @@ async def text_router(message: Message, state: FSMContext, db: Database):
             payload = f"Вопрос консьержу от @{message.from_user.username or message.from_user.id}:\n{text}"
             message_type = "консьержу"
         
-        if ADMIN_CHAT_ID:
+        if ADMIN_IDS:
             try:
-                await message.bot.send_message(
-                    ADMIN_CHAT_ID, payload, 
-                    parse_mode=None,  # Disable markdown parsing
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
-                )
+                # Send to all admins
+                for admin_id in ADMIN_IDS:
+                    await message.bot.send_message(
+                        admin_id, payload, 
+                        parse_mode=None,  # Disable markdown parsing
+                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
+                    )
             except Exception as e:
                 logger.exception("Failed to send admin message: %s", e)
         
@@ -390,7 +405,7 @@ async def text_router(message: Message, state: FSMContext, db: Database):
 
 async def media_router(message: Message):
     # Forward photos/videos to admin
-    if ADMIN_CHAT_ID:
+    if ADMIN_IDS:
         try:
             # Create a safe caption without markdown conflicts
             user_info = f"Медиа от @{message.from_user.username or message.from_user.id}"
@@ -401,42 +416,51 @@ async def media_router(message: Message):
             else:
                 caption = user_info
             
-            if message.photo:
-                await message.bot.send_photo(
-                    ADMIN_CHAT_ID, message.photo[-1].file_id,
-                    caption=caption,
-                    parse_mode=None,  # Disable markdown parsing to avoid conflicts
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
-                )
-            elif message.video:
-                await message.bot.send_video(
-                    ADMIN_CHAT_ID, message.video.file_id,
-                    caption=caption,
-                    parse_mode=None,  # Disable markdown parsing to avoid conflicts
-                    reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
-                )
+            # Send to all admins
+            for admin_id in ADMIN_IDS:
+                try:
+                    if message.photo:
+                        await message.bot.send_photo(
+                            admin_id, message.photo[-1].file_id,
+                            caption=caption,
+                            parse_mode=None,  # Disable markdown parsing to avoid conflicts
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
+                        )
+                    elif message.video:
+                        await message.bot.send_video(
+                            admin_id, message.video.file_id,
+                            caption=caption,
+                            parse_mode=None,  # Disable markdown parsing to avoid conflicts
+                            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
+                        )
+                except Exception as e:
+                    logger.error(f"Failed to send media to admin {admin_id}: {e}")
+                    
         except Exception as e:
             logger.exception("Failed to forward media: %s", e)
             # Try to send without caption if there's still an error
             try:
-                if message.photo:
-                    await message.bot.send_photo(
-                        ADMIN_CHAT_ID, message.photo[-1].file_id,
-                        caption=f"Медиа от @{message.from_user.username or message.from_user.id}",
-                        parse_mode=None,
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
-                    )
-                elif message.video:
-                    await message.bot.send_video(
-                        ADMIN_CHAT_ID, message.video.file_id,
-                        caption=f"Видео от @{message.from_user.username or message.from_user.id}",
-                        parse_mode=None,
-                        reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
-                    )
+                for admin_id in ADMIN_IDS:
+                    try:
+                        if message.photo:
+                            await message.bot.send_photo(
+                                admin_id, message.photo[-1].file_id,
+                                caption=f"Медиа от @{message.from_user.username or message.from_user.id}",
+                                parse_mode=None,
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
+                            )
+                        elif message.video:
+                            await message.bot.send_video(
+                                admin_id, message.video.file_id,
+                                caption=f"Видео от @{message.from_user.username or message.from_user.id}",
+                                reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
+                            )
+                    except Exception as e2:
+                        logger.error(f"Failed to send media to admin {admin_id} even without caption: {e2}")
             except Exception as e2:
-                logger.exception("Failed to forward media even without caption: %s", e2)
+                logger.exception("Failed to forward media even without caption: {e2}")
     
-    await message.answer("Принято! Передал администратору.")
+    await message.answer("Принято! Передал администраторам.")
 
 
 async def on_startup(bot: Bot, db: Database):
