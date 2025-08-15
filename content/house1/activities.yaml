@@ -2,7 +2,6 @@
   title: Посидеть у костра
   description_md: |
     Зажгите костёр в безопасном месте. Следуйте инструкциям и не оставляйте огонь без присмотра.
-  link_guide_id: firepit
   links:
     - https://youtu.be/dQw4w9WgXcQ
   months: [5,6,7,8,9]
@@ -10,7 +9,6 @@
   title: Сходить в баню
   description_md: |
     Отличный способ расслабиться. Не забудьте пить воду.
-  link_guide_id: sauna
   months: [1,2,3,4,5,6,7,8,9,10,11,12]
 - id: soup
   title: Приготовить что-то вкусное

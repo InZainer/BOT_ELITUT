@@ -27,11 +27,14 @@ class Activity:
     months: Optional[list[int]] = None  # 1..12
 
     def to_markdown(self) -> str:
-        parts = [f"*{self.title}*", self.description_md]
+        # Use bold formatting that's safer for Telegram
+        parts = [f"**{self.title}**", self.description_md]
         if self.link_guide_id:
             parts.append(f"Связано: {self.link_guide_id}")
         if self.links:
-            parts.append("Ссылки:\n" + "\n".join(f"- {u}" for u in self.links))
+            # Format links safely
+            link_text = "Ссылки:\n" + "\n".join(f"• {u}" for u in self.links)
+            parts.append(link_text)
         return "\n\n".join([p for p in parts if p])
 
 class ContentLoader:
@@ -60,16 +63,22 @@ class ContentLoader:
         if d.exists():
             for p in sorted(d.glob("*.md")):
                 gid = p.stem
-                title = gid.replace("_", " ").title()
-                res.append(Guide(id=gid, title=title, content_md=p.read_text(encoding="utf-8")))
+                content = p.read_text(encoding="utf-8")
+                # Use first line as title, fallback to filename if empty
+                lines = content.strip().split('\n')
+                title = lines[0].strip() if lines and lines[0].strip() else gid.replace("_", " ").title()
+                res.append(Guide(id=gid, title=title, content_md=content))
         return res
 
     def get_guide(self, house_id: str, guide_id: str) -> Optional[Guide]:
         p = self._house_dir(house_id) / "guides" / f"{guide_id}.md"
         if not p.exists():
             return None
-        title = guide_id.replace("_", " ").title()
-        return Guide(id=guide_id, title=title, content_md=p.read_text(encoding="utf-8"))
+        content = p.read_text(encoding="utf-8")
+        # Use first line as title, fallback to filename if empty
+        lines = content.strip().split('\n')
+        title = lines[0].strip() if lines and lines[0].strip() else guide_id.replace("_", " ").title()
+        return Guide(id=guide_id, title=title, content_md=content)
 
     def list_activities(self, house_id: str) -> List[Activity]:
         p = self._house_dir(house_id) / "activities.yaml"
