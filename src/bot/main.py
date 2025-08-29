@@ -3,6 +3,8 @@ import asyncio
 import logging
 import os
 from datetime import datetime, timedelta, timezone
+import re
+import sys
 from pathlib import Path
 from typing import Optional, Dict
 
@@ -44,6 +46,12 @@ AUTH_MODE = os.getenv("AUTH_MODE", "code")  # code | phone
 ACCESS_DAYS = int(os.getenv("ACCESS_DAYS", "30"))
 DB_PATH = os.getenv("DB_PATH", "./house-bots.db")
 
+# Security and performance settings
+CONCIERGE_MIN_INTERVAL_SECONDS = int(os.getenv("CONCIERGE_MIN_INTERVAL_SECONDS", "2"))
+CONCIERGE_WINDOW_SECONDS = int(os.getenv("CONCIERGE_WINDOW_SECONDS", "60"))
+CONCIERGE_MAX_MESSAGES_PER_WINDOW = int(os.getenv("CONCIERGE_MAX_MESSAGES_PER_WINDOW", "20"))
+MAX_MEDIA_SIZE_MB = int(os.getenv("MAX_MEDIA_SIZE_MB", "16"))
+
 # Parse admin IDs
 ADMIN_IDS = []
 if ADMIN_IDS_STR:
@@ -66,6 +74,58 @@ loader = ContentLoader(base_path=Path(__file__).resolve().parent.parent.parent /
 ADMIN_REPLY_TARGET: Dict[int, int] = {}  # admin_id -> target_user_id
 ADMIN_EDIT_PENDING: Dict[int, str] = {}  # admin_id -> rel_path to write
 ADMIN_PHOTO_PENDING: Dict[int, str] = {}  # admin_id -> content_path waiting for photo
+
+# In-memory stores for security/rate limits and simple caches
+CONCIERGE_RL: Dict[int, Dict[str, int]] = {}
+HOUSE_CACHE: Dict[str, dict] = {}
+MARKDOWN_CACHE: Dict[tuple, str] = {}
+
+
+def sanitize_markdown(text: str) -> str:
+    """Remove Telegram Markdown special characters to prevent injection when parse mode is enabled."""
+    if not text:
+        return ""
+    return re.sub(r"[*_`\[\]()>~#\+\-=|{}\.!]", "", text)
+
+
+def get_house_cached(house_id: str):
+    cached = HOUSE_CACHE.get(house_id)
+    if cached is not None:
+        return cached
+    house = loader.load_house(house_id)
+    HOUSE_CACHE[house_id] = house
+    return house
+
+
+def read_markdown_cached(house_id: str, rel_path: str) -> str:
+    key = (house_id, rel_path)
+    cached = MARKDOWN_CACHE.get(key)
+    if cached is not None:
+        return cached
+    content = loader.read_markdown(house_id, rel_path)
+    MARKDOWN_CACHE[key] = content
+    return content
+
+
+def allow_concierge_message(user_id: int) -> bool:
+    now_ts = int(datetime.now(timezone.utc).timestamp())
+    rec = CONCIERGE_RL.get(user_id)
+    if rec:
+        # Enforce min interval
+        if now_ts - rec.get("last_ts", 0) < CONCIERGE_MIN_INTERVAL_SECONDS:
+            return False
+        # Enforce windowed count
+        if now_ts - rec.get("first_ts", now_ts) > CONCIERGE_WINDOW_SECONDS:
+            # reset window
+            CONCIERGE_RL[user_id] = {"first_ts": now_ts, "count": 1, "last_ts": now_ts}
+        else:
+            if rec.get("count", 0) >= CONCIERGE_MAX_MESSAGES_PER_WINDOW:
+                return False
+            rec["count"] = rec.get("count", 0) + 1
+            rec["last_ts"] = now_ts
+    else:
+        CONCIERGE_RL[user_id] = {"first_ts": now_ts, "count": 1, "last_ts": now_ts}
+    return True
 
 async def ensure_db(db: Database):
     await db.init()
@@ -155,7 +215,7 @@ async def process_code(message: Message, state: FSMContext, db: Database):
 
 async def show_main_menu(message: Message):
     house_id = HOUSE_ID  # одна папка контента на бот
-    house = loader.load_house(house_id)
+    house = get_house_cached(house_id)
     title = house.name if house else "Дом"
     await message.answer(f"{title}. Главное меню:", reply_markup=main_menu_kb())
 
@@ -211,7 +271,7 @@ async def send_content_with_photo(cb: CallbackQuery, db: Database, content_path:
 async def handle_concierge_start(cb: CallbackQuery, state: FSMContext):
     """Start concierge conversation with proper state management"""
     user_id = cb.from_user.id
-    house = loader.load_house(HOUSE_ID)
+    house = get_house_cached(HOUSE_ID)
     
     # Set concierge state
     await state.set_state(ConciergeStates.waiting_for_message)
@@ -245,6 +305,10 @@ async def handle_concierge_message(message: Message, state: FSMContext, db: Data
     """Handle message in concierge mode"""
     user = message.from_user
     text = message.text or ""
+    # Simple rate limit to reduce spam
+    if not allow_concierge_message(user.id):
+        await message.answer("Слишком часто. Подождите пару секунд и попробуйте снова.")
+        return
     
     logger.info(f"Processing concierge message from user {user.id}: {text[:50]}...")
     
@@ -318,6 +382,10 @@ async def handle_concierge_message(message: Message, state: FSMContext, db: Data
 async def handle_concierge_media(message: Message, state: FSMContext):
     """Handle media in concierge mode"""
     user = message.from_user
+    # Rate limit media as well
+    if not allow_concierge_message(user.id):
+        await message.answer("Слишком часто. Подождите пару секунд и попробуйте снова.")
+        return
     
     logger.info(f"Processing concierge media from user {user.id}")
     
@@ -343,23 +411,30 @@ async def handle_concierge_media(message: Message, state: FSMContext):
             for admin_id in ADMIN_IDS:
                 try:
                     if message.photo:
+                        # Enforce simple size constraint if available
+                        if hasattr(message.photo[-1], 'file_size') and message.photo[-1].file_size and message.photo[-1].file_size > MAX_MEDIA_SIZE_MB * 1024 * 1024:
+                            logger.warning("Photo too large, skipping forwarding")
+                            continue
                         await message.bot.send_photo(
                             admin_id, message.photo[-1].file_id,
-                            caption=caption,
+                            caption=sanitize_markdown(caption),
                             parse_mode=ParseMode.MARKDOWN,
                             reply_markup=admin_kb
                         )
                     elif message.video:
+                        if hasattr(message.video, 'file_size') and message.video.file_size and message.video.file_size > MAX_MEDIA_SIZE_MB * 1024 * 1024:
+                            logger.warning("Video too large, skipping forwarding")
+                            continue
                         await message.bot.send_video(
                             admin_id, message.video.file_id,
-                            caption=caption,
+                            caption=sanitize_markdown(caption),
                             parse_mode=ParseMode.MARKDOWN,
                             reply_markup=admin_kb
                         )
                     elif message.document:
                         await message.bot.send_document(
                             admin_id, message.document.file_id,
-                            caption=caption,
+                            caption=sanitize_markdown(caption),
                             parse_mode=ParseMode.MARKDOWN,
                             reply_markup=admin_kb
                         )
@@ -401,7 +476,7 @@ async def handle_concierge_media(message: Message, state: FSMContext):
 
 async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
     data = cb.data or ""
-    house = loader.load_house(HOUSE_ID)
+    house = get_house_cached(HOUSE_ID)
 
     # Admin panel callbacks
     if data == "admin_ls":
@@ -466,13 +541,13 @@ async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
         return
 
     if data == "rules_house":
-        md = loader.read_markdown(HOUSE_ID, "texts/rules_house.md")
+        md = read_markdown_cached(HOUSE_ID, "texts/rules_house.md")
         await send_content_with_photo(cb, db, "texts/rules_house.md", md, back_kb())
         await cb.answer()
         return
 
     if data == "rules_inventory":
-        md = loader.read_markdown(HOUSE_ID, "texts/rules_inventory.md")
+        md = read_markdown_cached(HOUSE_ID, "texts/rules_inventory.md")
         await send_content_with_photo(cb, db, "texts/rules_inventory.md", md, back_kb())
         await cb.answer()
         return
@@ -517,7 +592,7 @@ async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
         return
 
     if data == "map":
-        md = loader.read_markdown(HOUSE_ID, "texts/map.md")
+        md = read_markdown_cached(HOUSE_ID, "texts/map.md")
         await send_content_with_photo(cb, db, "texts/map.md", md, back_kb())
         await cb.answer()
         return
@@ -529,25 +604,25 @@ async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
         return
 
     if data == "specials":
-        md = loader.read_markdown(HOUSE_ID, "texts/specials.md")
+        md = read_markdown_cached(HOUSE_ID, "texts/specials.md")
         await send_content_with_photo(cb, db, "texts/specials.md", md, back_kb())
         await cb.answer()
         return
 
     if data == "buy_house":
-        md = loader.read_markdown(HOUSE_ID, "texts/buy_house.md")
+        md = read_markdown_cached(HOUSE_ID, "texts/buy_house.md")
         await send_content_with_photo(cb, db, "texts/buy_house.md", md, back_kb())
         await cb.answer()
         return
 
     if data == "buy_furniture":
-        md = loader.read_markdown(HOUSE_ID, "texts/buy_furniture.md")
+        md = read_markdown_cached(HOUSE_ID, "texts/buy_furniture.md")
         await send_content_with_photo(cb, db, "texts/buy_furniture.md", md, back_kb())
         await cb.answer()
         return
 
     if data == "about":
-        md = loader.read_markdown(HOUSE_ID, "texts/about.md")
+        md = read_markdown_cached(HOUSE_ID, "texts/about.md")
         await send_content_with_photo(cb, db, "texts/about.md", md, back_kb())
         await cb.answer()
         return
@@ -659,6 +734,9 @@ async def media_router(message: Message):
             for admin_id in ADMIN_IDS:
                 try:
                     if message.photo:
+                        if hasattr(message.photo[-1], 'file_size') and message.photo[-1].file_size and message.photo[-1].file_size > MAX_MEDIA_SIZE_MB * 1024 * 1024:
+                            logger.warning("Photo too large, skipping forwarding")
+                            continue
                         await message.bot.send_photo(
                             admin_id, message.photo[-1].file_id,
                             caption=caption,
@@ -666,6 +744,9 @@ async def media_router(message: Message):
                             reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="Ответить", callback_data=f"admin_reply:{message.from_user.id}")]])
                         )
                     elif message.video:
+                        if hasattr(message.video, 'file_size') and message.video.file_size and message.video.file_size > MAX_MEDIA_SIZE_MB * 1024 * 1024:
+                            logger.warning("Video too large, skipping forwarding")
+                            continue
                         await message.bot.send_video(
                             admin_id, message.video.file_id,
                             caption=caption,
@@ -983,6 +1064,9 @@ async def admin_router(message: Message, db: Database):
 
 
 async def main():
+    if not BOT_TOKEN:
+        logger.critical("BOT_TOKEN is missing. Exiting.")
+        sys.exit(1)
     bot = Bot(BOT_TOKEN, default=DefaultBotProperties(parse_mode=ParseMode.MARKDOWN))
     dp = Dispatcher(storage=MemoryStorage())
     db = Database(DB_PATH)
