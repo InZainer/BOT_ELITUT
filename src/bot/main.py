@@ -10,7 +10,7 @@ from typing import Optional, Dict
 
 from aiogram import Bot, Dispatcher, F
 from aiogram.enums import ParseMode
-from aiogram.filters import CommandStart, Command
+from aiogram.filters import CommandStart, Command, StateFilter
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.state import State, StatesGroup
@@ -193,24 +193,41 @@ async def start_handler(message: Message, state: FSMContext, db: Database):
             return
         # Set waiting for code state
         await state.set_state(AuthStates.waiting_for_code)
+        current_state_after = await state.get_state()
+        logger.info(f"start_handler: set waiting_for_code state for user {user.id}, state after set: {current_state_after}")
         await message.answer("Добро пожаловать! Введите, пожалуйста, ваш числовой код доступа:")
 
 
 async def process_code(message: Message, state: FSMContext, db: Database):
-    code = message.text.strip() if message.text else ""
-    if not code.isdigit():
-        await message.answer("Код должен быть числом. Попробуйте ещё раз.")
-        # Keep the state - still waiting for code
-        return
-    ok, house_id = await db.consume_code(int(code), message.from_user.id, ACCESS_DAYS)
-    if not ok:
-        await message.answer("Код неверный или уже использован. Проверьте и введите снова.")
-        # Keep the state - still waiting for code
-        return
-    # Success - clear state and show menu
-    await state.clear()
-    await message.answer("Доступ предоставлен!", reply_markup=None)
-    await show_main_menu(message)
+    try:
+        code = message.text.strip() if message.text else ""
+        user_id = message.from_user.id if message.from_user else 0
+        logger.info(f"process_code: user_id={user_id}, code='{code}'")
+        
+        if not code.isdigit():
+            logger.warning(f"process_code: invalid code format from user {user_id}")
+            await message.answer("Код должен быть числом. Попробуйте ещё раз.")
+            # Keep the state - still waiting for code
+            return
+        
+        logger.info(f"process_code: attempting to consume code {code} for user {user_id}")
+        ok, house_id = await db.consume_code(int(code), user_id, ACCESS_DAYS)
+        logger.info(f"process_code: consume_code returned ok={ok}, house_id={house_id}")
+        
+        if not ok:
+            logger.warning(f"process_code: code {code} failed for user {user_id}")
+            await message.answer("Код неверный или уже использован. Проверьте и введите снова.")
+            # Keep the state - still waiting for code
+            return
+        
+        # Success - clear state and show menu
+        logger.info(f"process_code: code {code} successful for user {user_id}, granting access")
+        await state.clear()
+        await message.answer("Доступ предоставлен!", reply_markup=None)
+        await show_main_menu(message)
+    except Exception as e:
+        logger.exception(f"process_code: unexpected error for user {user_id}: {e}")
+        await message.answer("Произошла ошибка при обработке кода. Попробуйте ещё раз или обратитесь к администратору.")
 
 
 async def show_main_menu(message: Message):
@@ -641,7 +658,16 @@ async def text_router(message: Message, state: FSMContext, db: Database):
     logger.info(f"text_router: user_id={message.from_user.id}, state={current_state}, text='{text[:50]}...'")
 
     # If user is in waiting_for_code state, process the code
-    if current_state == AuthStates.waiting_for_code.state:
+    # In aiogram 3.x, state can be None, a State object, or a string
+    # Check if state matches waiting_for_code state
+    is_waiting_for_code = (
+        current_state == AuthStates.waiting_for_code or 
+        current_state == AuthStates.waiting_for_code.state or
+        (isinstance(current_state, str) and "waiting_for_code" in current_state)
+    )
+    
+    if is_waiting_for_code:
+        logger.info(f"text_router: user {message.from_user.id} is in waiting_for_code state, processing code")
         return await process_code(message, state, db)
     
     # If user is in concierge mode, handle the message appropriately
@@ -1081,6 +1107,11 @@ async def main():
     async def on_callback(cb: CallbackQuery, state: FSMContext):
         await callback_router(cb, state, db)
 
+    async def on_code_entry(message: Message, state: FSMContext):
+        """Handler specifically for code entry state"""
+        logger.info(f"on_code_entry: user {message.from_user.id} sent text in waiting_for_code state")
+        await process_code(message, state, db)
+    
     async def on_text(message: Message, state: FSMContext):
         await text_router(message, state, db)
 
@@ -1089,6 +1120,10 @@ async def main():
     dp.message.register(on_menu, Command("menu"))
     dp.callback_query.register(on_callback)
     
+    # Register code entry handler with state filter FIRST (higher priority)
+    dp.message.register(on_code_entry, F.text, StateFilter(AuthStates.waiting_for_code))
+    
+    # Then register general text handler
     dp.message.register(on_text, F.text)
     
     async def on_media(message: Message, state: FSMContext):
