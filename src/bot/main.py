@@ -74,6 +74,10 @@ loader = ContentLoader(base_path=Path(__file__).resolve().parent.parent.parent /
 ADMIN_REPLY_TARGET: Dict[int, int] = {}  # admin_id -> target_user_id
 ADMIN_EDIT_PENDING: Dict[int, str] = {}  # admin_id -> rel_path to write
 ADMIN_PHOTO_PENDING: Dict[int, str] = {}  # admin_id -> content_path waiting for photo
+ADMIN_VIDEO_PENDING: Dict[int, str] = {}  # admin_id -> content_path waiting for video
+
+# Locked content IDs that require permission
+LOCKED_CONTENT_IDS = ["sauna"]  # Add more content IDs here as needed
 
 # In-memory stores for security/rate limits and simple caches
 CONCIERGE_RL: Dict[int, Dict[str, int]] = {}
@@ -237,51 +241,50 @@ async def show_main_menu(message: Message):
     await message.answer(f"{title}. Главное меню:", reply_markup=main_menu_kb())
 
 
-async def send_content_with_photo(cb: CallbackQuery, db: Database, content_path: str, text_content: str, reply_markup, parse_mode=ParseMode.MARKDOWN):
-    """Helper function to send content with photo if available, fallback to text only"""
-    logger.info(f"send_content_with_photo: checking for photo at path '{content_path}'")
-    photo_file = await db.get_photo(content_path)
-    logger.info(f"send_content_with_photo: db.get_photo returned '{photo_file}'")
+async def send_content_with_media(cb: CallbackQuery, db: Database, content_path: str, text_content: str, reply_markup, parse_mode=ParseMode.MARKDOWN):
+    """Helper function to send content with photo/video if available, fallback to text only"""
+    logger.info(f"send_content_with_media: checking for media at path '{content_path}'")
+    media_info = await db.get_media(content_path)
     
-    if photo_file:
-        photos_dir = loader._house_dir(HOUSE_ID) / "photos"
-        photo_path = photos_dir / photo_file
-        logger.info(f"send_content_with_photo: checking if photo exists at '{photo_path}'")
-        logger.info(f"send_content_with_photo: photos_dir exists: {photos_dir.exists()}")
-        logger.info(f"send_content_with_photo: photo_path exists: {photo_path.exists()}")
+    if media_info:
+        media_file, media_type = media_info
+        media_dir = loader._house_dir(HOUSE_ID) / "photos"
+        media_path = media_dir / media_file
+        logger.info(f"send_content_with_media: checking if {media_type} exists at '{media_path}'")
         
-        if photo_path.exists():
-            logger.info(f"send_content_with_photo: photo found, sending photo with caption")
+        if media_path.exists():
+            logger.info(f"send_content_with_media: {media_type} found, sending with caption")
             try:
-                # For aiogram 3.x, use FSInputFile
-                input_file = FSInputFile(photo_path)
-                await cb.message.answer_photo(input_file, caption=text_content, parse_mode=parse_mode, reply_markup=reply_markup)
+                input_file = FSInputFile(media_path)
+                if media_type == 'video':
+                    await cb.message.answer_video(input_file, caption=text_content, parse_mode=parse_mode, reply_markup=reply_markup)
+                else:
+                    await cb.message.answer_photo(input_file, caption=text_content, parse_mode=parse_mode, reply_markup=reply_markup)
                 await cb.message.delete()
-                logger.info(f"send_content_with_photo: photo sent successfully")
+                logger.info(f"send_content_with_media: {media_type} sent successfully")
                 return
             except Exception as e:
-                logger.error(f"send_content_with_photo: error sending photo: {e}")
+                logger.error(f"send_content_with_media: error sending {media_type}: {e}")
                 logger.exception("Full traceback:")
-                # Fallback to text on error
-                logger.info(f"send_content_with_photo: falling back to text due to error")
+                logger.info(f"send_content_with_media: falling back to text due to error")
         else:
-            logger.warning(f"send_content_with_photo: photo file not found at '{photo_path}'")
-            # List available photos for debugging
-            if photos_dir.exists():
-                available_photos = list(photos_dir.glob("*"))
-                logger.info(f"send_content_with_photo: available photos in directory: {[p.name for p in available_photos]}")
+            logger.warning(f"send_content_with_media: {media_type} file not found at '{media_path}'")
     else:
-        logger.info(f"send_content_with_photo: no photo found in database for '{content_path}'")
+        logger.info(f"send_content_with_media: no media found in database for '{content_path}'")
     
     # Fallback to text only
-    logger.info(f"send_content_with_photo: falling back to text-only message")
+    logger.info(f"send_content_with_media: falling back to text-only message")
     try:
-        # Instead of edit_text, always answer a new message and delete the old one
         await cb.message.answer(text_content, parse_mode=parse_mode, reply_markup=reply_markup)
-        await cb.message.delete() # Delete the original message
+        await cb.message.delete()
     except Exception as e:
-        logger.error(f"send_content_with_photo: error sending text message fallback: {e}")
+        logger.error(f"send_content_with_media: error sending text message fallback: {e}")
         await cb.answer("Ошибка при отправке контента", show_alert=True)
+
+# Backward compatibility
+async def send_content_with_photo(cb: CallbackQuery, db: Database, content_path: str, text_content: str, reply_markup, parse_mode=ParseMode.MARKDOWN):
+    """Backward compatibility wrapper"""
+    return await send_content_with_media(cb, db, content_path, text_content, reply_markup, parse_mode)
 
 
 # Concierge functions
@@ -582,16 +585,57 @@ async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
         if not guide:
             await cb.answer("Не найдено", show_alert=False)
             return
-        # Use the common photo handling function
+        
+        # Check if content is locked and user has permission
+        if gid in LOCKED_CONTENT_IDS:
+            user_id = cb.from_user.id
+            is_admin_user = is_admin(user_id)
+            has_access = await db.has_permission(user_id, gid)
+            logger.info(f"Access check for guide '{gid}': user_id={user_id}, is_admin={is_admin_user}, has_permission={has_access}")
+            
+            if not has_access and not is_admin_user:
+                logger.warning(f"Access denied for user {user_id} to guide '{gid}'")
+                await cb.answer("🔒 Доступ ограничен. Обратитесь к администратору для получения доступа.", show_alert=True)
+                return
+            else:
+                logger.info(f"Access granted for user {user_id} to guide '{gid}'")
+        
+        # Use the common media handling function
         guide_path = f"guides/{gid}.md"
-        await send_content_with_photo(cb, db, guide_path, guide.content_md, 
+        await send_content_with_media(cb, db, guide_path, guide.content_md, 
                                     InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="howto")]]),
                                     ParseMode.MARKDOWN)
         await cb.answer()
         return
 
     if data == "activities":
+        user_id = cb.from_user.id
+        is_admin_user = is_admin(user_id)
         acts = [a for a in loader.list_activities(HOUSE_ID) if month_in_season(a)]
+        
+        logger.info(f"Activities menu: user_id={user_id}, is_admin={is_admin_user}, total_activities={len(acts)}, LOCKED_CONTENT_IDS={LOCKED_CONTENT_IDS}")
+        
+        # Filter out locked activities if user doesn't have permission
+        if not is_admin_user:
+            filtered_acts = []
+            for act in acts:
+                if act.id not in LOCKED_CONTENT_IDS:
+                    filtered_acts.append(act)
+                    logger.debug(f"Activity '{act.id}' is not locked, adding to menu")
+                else:
+                    # Check if user has permission
+                    has_access = await db.has_permission(user_id, act.id)
+                    logger.info(f"Locked activity '{act.id}': user {user_id} has_permission={has_access}")
+                    if has_access:
+                        filtered_acts.append(act)
+                        logger.info(f"Activity '{act.id}' added to menu (user has permission)")
+                    else:
+                        logger.info(f"Activity '{act.id}' filtered out (user has no permission)")
+            acts = filtered_acts
+            logger.info(f"Filtered activities count: {len(acts)}")
+        else:
+            logger.info(f"Admin user, showing all {len(acts)} activities")
+        
         await cb.message.answer("Чем заняться?", reply_markup=activities_menu_kb(acts))
         await cb.message.delete()
         await cb.answer()
@@ -599,10 +643,35 @@ async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
 
     if data.startswith("activity:"):
         aid = data.split(":", 1)[1]
+        logger.info(f"Processing activity callback: aid='{aid}', LOCKED_CONTENT_IDS={LOCKED_CONTENT_IDS}")
         act = loader.get_activity(HOUSE_ID, aid)
         if not act:
             await cb.answer("Не найдено", show_alert=False)
             return
+        
+        # Check if content is locked and user has permission
+        user_id = cb.from_user.id
+        is_admin_user = is_admin(user_id)
+        is_locked = aid in LOCKED_CONTENT_IDS
+        
+        logger.info(f"Activity '{aid}' access check: user_id={user_id}, is_admin={is_admin_user}, is_locked={is_locked}, LOCKED_CONTENT_IDS={LOCKED_CONTENT_IDS}")
+        
+        if is_locked:
+            has_access = await db.has_permission(user_id, aid)
+            logger.info(f"Permission check result for user {user_id} and content '{aid}': has_permission={has_access}")
+            
+            # Block access if user is not admin and doesn't have permission
+            if not is_admin_user and not has_access:
+                logger.warning(f"❌ ACCESS DENIED: user {user_id} attempted to access locked activity '{aid}' without permission")
+                await cb.answer("🔒 Доступ ограничен. Обратитесь к администратору для получения доступа.", show_alert=True)
+                return
+            else:
+                reason = "admin" if is_admin_user else "has permission"
+                logger.info(f"✅ ACCESS GRANTED: user {user_id} can access '{aid}' ({reason})")
+        else:
+            logger.info(f"✅ Activity '{aid}' is not locked, access granted")
+        
+        # Show content only if access is granted
         await cb.message.answer(act.to_markdown(), parse_mode=None, reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="activities")]]))
         await cb.message.delete()
         await cb.answer()
@@ -918,8 +987,23 @@ async def admin_router(message: Message, db: Database):
 2️⃣ Отправьте фото отдельным сообщением
 💡 Если фото уже есть - оно заменится
 
-🗑️ **/delpic <путь>** - Удалить фото контента
+🎥 **/video <путь>** - Добавить видео к контенту
+Как использовать:
+1️⃣ Напишите `/video guides/sauna.md`
+2️⃣ Отправьте видео отдельным сообщением
+💡 Если видео уже есть - оно заменится
+
+🗑️ **/delpic <путь>** - Удалить фото/видео контента
 Пример: `/delpic texts/about.md`
+
+🔓 **/grant <user_id> <content_id>** - Выдать доступ к заблокированному контенту
+Пример: `/grant 123456789 sauna`
+
+🔒 **/revoke <user_id> <content_id>** - Отозвать доступ к контенту
+Пример: `/revoke 123456789 sauna`
+
+📋 **/permissions <user_id>** - Показать все разрешения пользователя
+Пример: `/permissions 123456789`
 
 ⚙️ **Примеры путей:**
 • `texts/about.md` - О проекте
@@ -985,31 +1069,54 @@ async def admin_router(message: Message, db: Database):
         )
         return
 
+    if txt.startswith("/video "):
+        content_path = txt.split(" ", 1)[1].strip()
+        ADMIN_VIDEO_PENDING[user.id] = content_path
+        await message.answer(
+            f"🎥 Добавление видео для: {content_path}\n\n"
+            f"📤 Отправьте видео следующим сообщением.\n"
+            f"💡 Если видео уже существует, оно будет заменено.",
+            parse_mode=None
+        )
+        return
+
     if txt.startswith("/delpic "):
         content_path = txt.split(" ", 1)[1].strip()
+        # Get media info before deleting
+        media_info = await db.get_media(content_path)
         deleted = await db.delete_photo(content_path)
         if deleted:
             # Also delete the physical file if exists
             photos_dir = loader._house_dir(HOUSE_ID) / "photos"
-            photo_file = await db.get_photo(content_path)  # This will return None now since we deleted it
-            # Try to find and delete the old photo file
-            for photo_path in photos_dir.glob(f"{content_path.replace('/', '_')}.*"):
+            if media_info:
+                media_file, media_type = media_info
+                media_path = photos_dir / media_file
                 try:
-                    photo_path.unlink()
-                    logger.info(f"Deleted photo file: {photo_path}")
+                    if media_path.exists():
+                        media_path.unlink()
+                        logger.info(f"Deleted {media_type} file: {media_path}")
                 except Exception as e:
-                    logger.error(f"Failed to delete photo file {photo_path}: {e}")
+                    logger.error(f"Failed to delete {media_type} file {media_path}: {e}")
+            else:
+                # Fallback: try to find and delete by pattern
+                for media_path in photos_dir.glob(f"{content_path.replace('/', '_')}.*"):
+                    try:
+                        media_path.unlink()
+                        logger.info(f"Deleted media file: {media_path}")
+                    except Exception as e:
+                        logger.error(f"Failed to delete media file {media_path}: {e}")
+            media_type_name = media_info[1] if media_info else "медиа"
             await message.answer(
-                f"✅ **Фото удалено!**\n\n"
+                f"✅ **{media_type_name.capitalize()} удалено!**\n\n"
                 f"📁 Контент: {content_path}\n"
-                f"🗑️ Фото больше не привязано к этому контенту.",
+                f"🗑️ {media_type_name.capitalize()} больше не привязано к этому контенту.",
                 parse_mode=None
             )
         else:
             await message.answer(
-                f"⚠️ **Фото не найдено**\n\n"
+                f"⚠️ **Медиа не найдено**\n\n"
                 f"📁 Контент: {content_path}\n"
-                f"🔍 К этому контенту не привязано фото.",
+                f"🔍 К этому контенту не привязано медиа.",
                 parse_mode=None
             )
         return
@@ -1088,6 +1195,122 @@ async def admin_router(message: Message, db: Database):
             )
         return
 
+    # If pending video and admin sends video
+    if message.video and user.id in ADMIN_VIDEO_PENDING:
+        content_path = ADMIN_VIDEO_PENDING[user.id]
+        video = message.video
+        
+        try:
+            # Download the video
+            file_info = await message.bot.get_file(video.file_id)
+            file_extension = file_info.file_path.split('.')[-1] if file_info.file_path else 'mp4'
+            
+            # Generate filename based on content path
+            safe_name = content_path.replace('/', '_').replace('\\', '_')
+            video_filename = f"{safe_name}.{file_extension}"
+            
+            # Create photos directory (used for all media)
+            photos_dir = loader._house_dir(HOUSE_ID) / "photos"
+            photos_dir.mkdir(exist_ok=True)
+            
+            # Download and save video
+            video_path = photos_dir / video_filename
+            await message.bot.download_file(file_info.file_path, video_path)
+            
+            # Save to database
+            await db.add_video(content_path, video_filename)
+            
+            # Clean up pending state
+            ADMIN_VIDEO_PENDING.pop(user.id, None)
+            
+            await message.answer(
+                f"✅ **Видео успешно добавлено!**\n\n"
+                f"📁 Контент: {content_path}\n"
+                f"🎥 Файл: {video_filename}\n"
+                f"📊 Размер: {video.file_size if video.file_size else 'неизвестно'} байт\n"
+                f"🎯 Видео будет показываться пользователям при просмотре этого контента!",
+                parse_mode=None
+            )
+            logger.info(f"Video saved for {content_path}: {video_filename}")
+            
+        except Exception as e:
+            logger.exception(f"Failed to save video for {content_path}: {e}")
+            await message.answer(
+                f"❌ **Ошибка при сохранении видео**\n\n"
+                f"📁 Контент: {content_path}\n"
+                f"🔧 Попробуйте еще раз или обратитесь к разработчику.\n"
+                f"Ошибка: {str(e)}",
+                parse_mode=None
+            )
+        return
+
+    # Permission management commands
+    if txt.startswith("/grant "):
+        parts = txt.split(" ", 2)
+        if len(parts) < 3:
+            await message.answer("❌ Неверный формат. Используйте: `/grant <user_id> <content_id>`\nПример: `/grant 123456789 sauna`", parse_mode=None)
+            return
+        try:
+            target_user_id = int(parts[1])
+            content_id = parts[2].strip()
+            granted = await db.grant_permission(target_user_id, content_id, user.id)
+            if granted:
+                await message.answer(
+                    f"✅ **Доступ выдан!**\n\n"
+                    f"👤 Пользователь: {target_user_id}\n"
+                    f"📁 Контент: {content_id}\n"
+                    f"🔓 Теперь пользователь может просматривать этот контент.",
+                    parse_mode=None
+                )
+            else:
+                await message.answer("❌ Ошибка при выдаче доступа.", parse_mode=None)
+        except ValueError:
+            await message.answer("❌ Неверный формат user_id. Должно быть число.", parse_mode=None)
+        return
+
+    if txt.startswith("/revoke "):
+        parts = txt.split(" ", 2)
+        if len(parts) < 3:
+            await message.answer("❌ Неверный формат. Используйте: `/revoke <user_id> <content_id>`\nПример: `/revoke 123456789 sauna`", parse_mode=None)
+            return
+        try:
+            target_user_id = int(parts[1])
+            content_id = parts[2].strip()
+            revoked = await db.revoke_permission(target_user_id, content_id)
+            if revoked:
+                await message.answer(
+                    f"✅ **Доступ отозван!**\n\n"
+                    f"👤 Пользователь: {target_user_id}\n"
+                    f"📁 Контент: {content_id}\n"
+                    f"🔒 Пользователь больше не может просматривать этот контент.",
+                    parse_mode=None
+                )
+            else:
+                await message.answer("⚠️ Доступ не найден или уже отозван.", parse_mode=None)
+        except ValueError:
+            await message.answer("❌ Неверный формат user_id. Должно быть число.", parse_mode=None)
+        return
+
+    if txt.startswith("/permissions "):
+        parts = txt.split(" ", 1)
+        if len(parts) < 2:
+            await message.answer("❌ Неверный формат. Используйте: `/permissions <user_id>`\nПример: `/permissions 123456789`", parse_mode=None)
+            return
+        try:
+            target_user_id = int(parts[1])
+            permissions = await db.list_user_permissions(target_user_id)
+            if permissions:
+                perm_list = "\n".join([f"• {p['content_id']} (выдано: {p['granted_at'][:10]})" for p in permissions])
+                await message.answer(
+                    f"📋 **Разрешения пользователя {target_user_id}:**\n\n{perm_list}",
+                    parse_mode=None
+                )
+            else:
+                await message.answer(f"📋 У пользователя {target_user_id} нет специальных разрешений.", parse_mode=None)
+        except ValueError:
+            await message.answer("❌ Неверный формат user_id. Должно быть число.", parse_mode=None)
+        return
+
 
 async def main():
     if not BOT_TOKEN:
@@ -1127,9 +1350,15 @@ async def main():
     dp.message.register(on_text, F.text)
     
     async def on_media(message: Message, state: FSMContext):
-        # Check if admin is uploading photo for content
-        if message.from_user and is_admin(message.from_user.id) and message.photo:
-            await admin_router(message, db)
+        # Check if admin is uploading photo/video for content
+        if message.from_user and is_admin(message.from_user.id):
+            if message.photo and message.from_user.id in ADMIN_PHOTO_PENDING:
+                await admin_router(message, db)
+            elif message.video and message.from_user.id in ADMIN_VIDEO_PENDING:
+                await admin_router(message, db)
+            else:
+                # Admin sending media to user (reply mode)
+                await admin_router(message, db)
         else:
             # Check if user is in concierge mode
             current_state = await state.get_state()
