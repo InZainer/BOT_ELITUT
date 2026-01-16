@@ -4,16 +4,24 @@
     Зажгите костёр в безопасном месте. Следуйте инструкциям и не оставляйте огонь без присмотра.
   links:
     - https://youtu.be/dQw4w9WgXcQ
-  months: [5,6,7,8,9]
 - id: sauna
   title: Сходить в баню
   description_md: |
     Отличный способ расслабиться. Не забудьте пить воду.
-  months: [1,2,3,4,5,6,7,8,9,10,11,12]
-- id: soup
+- id: cooking
   title: Приготовить что-то вкусное
   description_md: |
     Выберите рецепт и приготовьте ужин на гриле или на кухне.
   links:
     - https://www.youtube.com/results?search_query=рецепты+на+гриле
+- id: quest
+  title: Пройти квест в доме
+  description_md: |
+    Пройдите квест в доме и получите приз.
+- id: forest
+  title: Гулять по лесу
+  description_md: |
+    Погуляйте по лесу и посмотрите на природу.
+  links:
+    - https://www.youtube.com/results?search_query=гулять+по+лесу
 

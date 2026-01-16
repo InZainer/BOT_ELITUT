@@ -46,6 +46,33 @@ class Database:
                 UNIQUE(content_path)
             )
             """)
+            
+            # Migration: Rename photo_file to media_file if needed
+            async with db.execute("PRAGMA table_info(photos)") as cur:
+                columns = await cur.fetchall()
+                column_names = [col[1] for col in columns]
+                
+                # Check if old schema exists (has photo_file but not media_file)
+                if 'photo_file' in column_names and 'media_file' not in column_names:
+                    logger.info("Migrating photos table from photo_file to media_file")
+                    await db.execute("""
+                        CREATE TABLE photos_new (
+                            id INTEGER PRIMARY KEY AUTOINCREMENT,
+                            content_path TEXT NOT NULL,
+                            media_file TEXT NOT NULL,
+                            media_type TEXT NOT NULL DEFAULT 'photo',
+                            added_at TEXT NOT NULL,
+                            UNIQUE(content_path)
+                        )
+                    """)
+                    await db.execute("""
+                        INSERT INTO photos_new (id, content_path, media_file, media_type, added_at)
+                        SELECT id, content_path, photo_file, 'photo', added_at FROM photos
+                    """)
+                    await db.execute("DROP TABLE photos")
+                    await db.execute("ALTER TABLE photos_new RENAME TO photos")
+                    logger.info("Migration completed")
+            
             # Store user permissions for locked content
             await db.execute("""
             CREATE TABLE IF NOT EXISTS user_permissions (
@@ -211,5 +238,5 @@ class Database:
         """List all photos."""
         async with aiosqlite.connect(self.path) as db:
             db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT content_path, photo_file FROM photos ORDER BY content_path") as cur:
+            async with db.execute("SELECT content_path, media_file, media_type FROM photos ORDER BY content_path") as cur:
                 return [dict(row) async for row in cur]
