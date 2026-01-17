@@ -142,17 +142,24 @@ def is_admin(user_id: int) -> bool:
 
 def main_menu_kb():
     btns = [
-        [InlineKeyboardButton(text="Консьерж (9–21)", callback_data="concierge")],
-        [InlineKeyboardButton(text="Правила дома", callback_data="rules_house")],
-        [InlineKeyboardButton(text="Инвентарь", callback_data="rules_inventory")],
-        [InlineKeyboardButton(text="Как это работает?", callback_data="howto")],
-        [InlineKeyboardButton(text="Чем заняться?", callback_data="activities")],
-        [InlineKeyboardButton(text="Карта локаций", callback_data="map")],
-        [InlineKeyboardButton(text="Обратная связь", callback_data="feedback")],
-        [InlineKeyboardButton(text="Спецпредложения", callback_data="specials")],
-        [InlineKeyboardButton(text="Купить дом", callback_data="buy_house")],
-        [InlineKeyboardButton(text="Купить мебель", callback_data="buy_furniture")],
-        [InlineKeyboardButton(text="О проекте", callback_data="about")],
+        [InlineKeyboardButton(text="📍 Как к нам попасть", callback_data="how_to_reach")],
+        [InlineKeyboardButton(text="📖 Правила пользования домом", callback_data="rules_house")],
+        [InlineKeyboardButton(text="⚙️ Как что работает?", callback_data="howto")],
+        [InlineKeyboardButton(text="🎯 Чем заняться?", callback_data="activities")],
+        [InlineKeyboardButton(text="🗺️ Карта локаций", callback_data="map")],
+        [InlineKeyboardButton(text="💬 Обратная связь", callback_data="feedback")],
+        [InlineKeyboardButton(text="👨‍💼 Консьерж (9–21)", callback_data="concierge")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=btns)
+
+
+def houses_menu_kb():
+    """Menu for selecting a house"""
+    btns = [
+        [InlineKeyboardButton(text="🏡 Дом 1 'Рустик' (28В)", callback_data="house:rustic")],
+        [InlineKeyboardButton(text="🏡 Дом 2 'Лофт' (28Б)", callback_data="house:loft")],
+        [InlineKeyboardButton(text="🏡 Дом 3 'Икигай' (28А)", callback_data="house:ikigai")],
+        [InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")],
     ]
     return InlineKeyboardMarkup(inline_keyboard=btns)
 
@@ -513,7 +520,11 @@ async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
         if (base / "activities.yaml").exists():
             files.append("activities.yaml")
         listing = "\n".join(files) if files else "Нет файлов"
-        await cb.message.answer(f"Файлы контента (дом {HOUSE_ID}):\n{listing}", reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")]]))
+        await cb.message.answer(
+            f"Файлы контента (дом {HOUSE_ID}):\n{listing}", 
+            parse_mode=None,  # Disable markdown parsing for file names
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="⬅️ Назад", callback_data="back_main")]])
+        )
         await cb.message.delete()
         await cb.answer()
         return
@@ -560,15 +571,36 @@ async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
         await cb.answer()
         return
 
-    if data == "rules_house":
-        md = read_markdown_cached(HOUSE_ID, "texts/rules_house.md")
-        await send_content_with_photo(cb, db, "texts/rules_house.md", md, back_kb())
+    if data == "how_to_reach":
+        md = read_markdown_cached(HOUSE_ID, "texts/how_to_reach.md")
+        await cb.message.answer(md, parse_mode=ParseMode.MARKDOWN, reply_markup=houses_menu_kb())
+        await cb.message.delete()
+        await cb.answer()
+        return
+    
+    if data.startswith("house:"):
+        house_name = data.split(":", 1)[1]
+        house_file_map = {
+            "rustic": "texts/house_rustic.md",
+            "loft": "texts/house_loft.md",
+            "ikigai": "texts/house_ikigai.md"
+        }
+        
+        if house_name in house_file_map:
+            md = read_markdown_cached(HOUSE_ID, house_file_map[house_name])
+            back_to_houses_kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ К выбору дома", callback_data="how_to_reach")],
+                [InlineKeyboardButton(text="🏠 В главное меню", callback_data="back_main")]
+            ])
+            await send_content_with_photo(cb, db, house_file_map[house_name], md, back_to_houses_kb)
+        else:
+            await cb.answer("Не найдено", show_alert=False)
         await cb.answer()
         return
 
-    if data == "rules_inventory":
-        md = read_markdown_cached(HOUSE_ID, "texts/rules_inventory.md")
-        await send_content_with_photo(cb, db, "texts/rules_inventory.md", md, back_kb())
+    if data == "rules_house":
+        md = read_markdown_cached(HOUSE_ID, "texts/rules_house.md")
+        await send_content_with_photo(cb, db, "texts/rules_house.md", md, back_kb())
         await cb.answer()
         return
 
@@ -684,32 +716,15 @@ async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
         return
 
     if data == "feedback":
-        await cb.message.answer("Оставьте текст отзыва/сообщения. Можете прикрепить фото/видео отдельными сообщениями. В начале напишите: Разрешаю публикацию — да/нет.\n\n📷 Вы также можете прикрепить фото или видео к вашему отзыву, отправив их отдельным сообщением.", reply_markup=back_kb())
+        feedback_text = (
+            "💬 **Обратная связь**\n\n"
+            "Оставьте текст вашего отзыва или сообщения.\n\n"
+            "❗ **Важно:** В начале сообщения укажите:\n"
+            "🔹 **Разрешаю публикацию — да** или **нет**\n\n"
+            "📷 Вы также можете прикрепить фото или видео, отправив их отдельным сообщением."
+        )
+        await cb.message.answer(feedback_text, parse_mode=ParseMode.MARKDOWN, reply_markup=back_kb())
         await cb.message.delete()
-        await cb.answer()
-        return
-
-    if data == "specials":
-        md = read_markdown_cached(HOUSE_ID, "texts/specials.md")
-        await send_content_with_photo(cb, db, "texts/specials.md", md, back_kb())
-        await cb.answer()
-        return
-
-    if data == "buy_house":
-        md = read_markdown_cached(HOUSE_ID, "texts/buy_house.md")
-        await send_content_with_photo(cb, db, "texts/buy_house.md", md, back_kb())
-        await cb.answer()
-        return
-
-    if data == "buy_furniture":
-        md = read_markdown_cached(HOUSE_ID, "texts/buy_furniture.md")
-        await send_content_with_photo(cb, db, "texts/buy_furniture.md", md, back_kb())
-        await cb.answer()
-        return
-
-    if data == "about":
-        md = read_markdown_cached(HOUSE_ID, "texts/about.md")
-        await send_content_with_photo(cb, db, "texts/about.md", md, back_kb())
         await cb.answer()
         return
 
@@ -973,45 +988,43 @@ async def admin_router(message: Message, db: Database):
     if txt == "/admin" or txt == "/admin_menu":
         help_text = """🔧 **Админ-панель для дома {house_id}**
 
-📁 **/ls** - Показать все файлы контента
+📁 /ls - Показать все файлы контента
 Пример: просто напишите `/ls`
 
-📝 **/put <путь>** - Изменить файл
+📝 /put <путь> - Изменить файл
 Как использовать:
 1️⃣ Напишите `/put texts/about.md`
 2️⃣ Отправьте новый текст отдельным сообщением
 
-📷 **/photo <путь>** - Добавить фото к контенту
+📷 /photo <путь> - Добавить фото к контенту
 Как использовать:
 1️⃣ Напишите `/photo texts/about.md`
 2️⃣ Отправьте фото отдельным сообщением
 💡 Если фото уже есть - оно заменится
 
-🎥 **/video <путь>** - Добавить видео к контенту
+🎥 /video <путь> - Добавить видео к контенту
 Как использовать:
 1️⃣ Напишите `/video guides/sauna.md`
 2️⃣ Отправьте видео отдельным сообщением
 💡 Если видео уже есть - оно заменится
 
-🗑️ **/delpic <путь>** - Удалить фото/видео контента
+🗑️ /delpic <путь> - Удалить фото/видео контента
 Пример: `/delpic texts/about.md`
 
-🔓 **/grant <user_id> <content_id>** - Выдать доступ к заблокированному контенту
+🔓 /grant <user_id> <content_id> - Выдать доступ к заблокированному контенту
 Пример: `/grant 123456789 sauna`
 
-🔒 **/revoke <user_id> <content_id>** - Отозвать доступ к контенту
+🔒 /revoke <user_id> <content_id> - Отозвать доступ к контенту
 Пример: `/revoke 123456789 sauna`
 
-📋 **/permissions <user_id>** - Показать все разрешения пользователя
+📋 /permissions <user_id> - Показать все разрешения пользователя
 Пример: `/permissions 123456789`
 
-⚙️ **Примеры путей:**
+⚙️ Примеры путей:
 • `texts/about.md` - О проекте
 • `texts/rules_house.md` - Правила дома
 • `guides/sauna.md` - Гид по бане
-• `activities.yaml` - Список активностей
-
-📊 **Статистика:** Коды работают многоразово ✅""".format(house_id=HOUSE_ID)
+• `activities.yaml` - Список активностей""".format(house_id=HOUSE_ID)
         
         kb = InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="📁 Список файлов", callback_data="admin_ls")],
