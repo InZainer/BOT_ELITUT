@@ -26,7 +26,6 @@ from .utils import month_in_season
 
 # FSM States
 class AuthStates(StatesGroup):
-    waiting_for_code = State()
     waiting_for_photo = State()  # Admin waiting for photo upload
 
 class ConciergeStates(StatesGroup):
@@ -42,8 +41,6 @@ load_dotenv()
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_IDS_STR = os.getenv("ADMIN_IDS", "")  # Multiple admin IDs separated by comma
 HOUSE_ID = os.getenv("HOUSE_ID", "house1")
-AUTH_MODE = os.getenv("AUTH_MODE", "code")  # code | phone
-ACCESS_DAYS = int(os.getenv("ACCESS_DAYS", "30"))
 DB_PATH = os.getenv("DB_PATH", "./house-bots.db")
 
 # Security and performance settings
@@ -188,57 +185,15 @@ async def start_handler(message: Message, state: FSMContext, db: Database):
     # Clear any existing state first
     await state.clear()
     
-    # Auth flow
-    if AUTH_MODE == "phone":
-        # placeholder: allow after sharing contact
-        kb = ReplyKeyboardMarkup(resize_keyboard=True, one_time_keyboard=True, keyboard=[[KeyboardButton(text="Поделиться телефоном", request_contact=True)]] )
-        await message.answer("Для доступа поделитесь номером телефона.", reply_markup=kb)
-        return
-    else:
-        # code auth
-        profile = await db.get_user(user.id)
-        now = datetime.now(timezone.utc)
-        if profile and profile.get("access_until") and datetime.fromisoformat(profile["access_until"]) > now:
-            await message.answer("Добро пожаловать обратно!", reply_markup=None)
-            await show_main_menu(message)
-            return
-        # Set waiting for code state
-        await state.set_state(AuthStates.waiting_for_code)
-        current_state_after = await state.get_state()
-        logger.info(f"start_handler: set waiting_for_code state for user {user.id}, state after set: {current_state_after}")
-        await message.answer("Добро пожаловать! Введите, пожалуйста, ваш числовой код доступа:")
+    # Register user (update last seen)
+    await db.upsert_user_access(user.id)
+    
+    # Direct access
+    await message.answer("Добро пожаловать!", reply_markup=None)
+    await show_main_menu(message)
 
 
-async def process_code(message: Message, state: FSMContext, db: Database):
-    try:
-        code = message.text.strip() if message.text else ""
-        user_id = message.from_user.id if message.from_user else 0
-        logger.info(f"process_code: user_id={user_id}, code='{code}'")
-        
-        if not code.isdigit():
-            logger.warning(f"process_code: invalid code format from user {user_id}")
-            await message.answer("Код должен быть числом. Попробуйте ещё раз.")
-            # Keep the state - still waiting for code
-            return
-        
-        logger.info(f"process_code: attempting to consume code {code} for user {user_id}")
-        ok, house_id = await db.consume_code(int(code), user_id, ACCESS_DAYS)
-        logger.info(f"process_code: consume_code returned ok={ok}, house_id={house_id}")
-        
-        if not ok:
-            logger.warning(f"process_code: code {code} failed for user {user_id}")
-            await message.answer("Код неверный или уже использован. Проверьте и введите снова.")
-            # Keep the state - still waiting for code
-            return
-        
-        # Success - clear state and show menu
-        logger.info(f"process_code: code {code} successful for user {user_id}, granting access")
-        await state.clear()
-        await message.answer("Доступ предоставлен!", reply_markup=None)
-        await show_main_menu(message)
-    except Exception as e:
-        logger.exception(f"process_code: unexpected error for user {user_id}: {e}")
-        await message.answer("Произошла ошибка при обработке кода. Попробуйте ещё раз или обратитесь к администратору.")
+
 
 
 async def show_main_menu(message: Message):
@@ -777,18 +732,7 @@ async def text_router(message: Message, state: FSMContext, db: Database):
     text = message.text or ""
     logger.info(f"text_router: user_id={message.from_user.id}, state={current_state}, text='{text[:50]}...'")
 
-    # If user is in waiting_for_code state, process the code
-    # In aiogram 3.x, state can be None, a State object, or a string
-    # Check if state matches waiting_for_code state
-    is_waiting_for_code = (
-        current_state == AuthStates.waiting_for_code or 
-        current_state == AuthStates.waiting_for_code.state or
-        (isinstance(current_state, str) and "waiting_for_code" in current_state)
-    )
-    
-    if is_waiting_for_code:
-        logger.info(f"text_router: user {message.from_user.id} is in waiting_for_code state, processing code")
-        return await process_code(message, state, db)
+
     
     # If user is in concierge mode, handle the message appropriately
     if current_state == ConciergeStates.waiting_for_message.state:
@@ -797,16 +741,8 @@ async def text_router(message: Message, state: FSMContext, db: Database):
         # In this state, user can send additional text messages
         return await handle_concierge_message(message, state, db)
 
-    # Check if user is authorized for normal operations
-    profile = await db.get_user(message.from_user.id)
-    now = datetime.now(timezone.utc)
-    authorized = bool(profile and profile.get("access_until") and datetime.fromisoformat(profile["access_until"]) > now)
-    
-    if not authorized and AUTH_MODE == "code":
-        # User is not authorized, ask for code
-        await state.set_state(AuthStates.waiting_for_code)
-        await message.answer("Для доступа к боту введите, пожалуйста, ваш числовой код доступа:")
-        return
+    # Ensure user is registered
+    await db.upsert_user_access(message.from_user.id)
 
     # Only forward messages that are explicitly concierge questions or feedback
     # Check if this looks like a concierge question or feedback
@@ -1410,7 +1346,7 @@ async def main():
     dp.callback_query.register(on_callback)
     
     # Register code entry handler with state filter FIRST (higher priority)
-    dp.message.register(on_code_entry, F.text, StateFilter(AuthStates.waiting_for_code))
+    # dp.message.register(on_code_entry, F.text, StateFilter(AuthStates.waiting_for_code))
     
     # Then register general text handler
     dp.message.register(on_text, F.text)

@@ -19,22 +19,7 @@ class Database:
                 access_until TEXT
             )
             """)
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS codes (
-                code INTEGER PRIMARY KEY,
-                house_id TEXT NOT NULL
-            )
-            """)
-            # Track code usage for analytics without blocking reuse
-            await db.execute("""
-            CREATE TABLE IF NOT EXISTS code_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                code INTEGER NOT NULL,
-                user_id INTEGER NOT NULL,
-                used_at TEXT NOT NULL,
-                FOREIGN KEY (code) REFERENCES codes (code)
-            )
-            """)
+            
             # Store photos and videos associated with content
             await db.execute("""
             CREATE TABLE IF NOT EXISTS photos (
@@ -94,7 +79,8 @@ class Database:
                 row = await cur.fetchone()
                 return dict(row) if row else None
 
-    async def upsert_user_access(self, user_id: int, days: int):
+    async def upsert_user_access(self, user_id: int, days: int = 9999):
+        """Register or update user access."""
         now = datetime.now(timezone.utc)
         access_until = now + timedelta(days=days)
         async with aiosqlite.connect(self.path) as db:
@@ -102,41 +88,6 @@ class Database:
                 "INSERT INTO users(user_id, first_seen, access_until) VALUES(?,?,?)\n                 ON CONFLICT(user_id) DO UPDATE SET access_until=excluded.access_until",
                 (user_id, now.isoformat(), access_until.isoformat()),
             )
-            await db.commit()
-
-    async def consume_code(self, code: int, user_id: int, days: int) -> Tuple[bool, Optional[str]]:
-        """Check if code is valid and grant access. Code can be used by multiple users. Return (ok, house_id)."""
-        async with aiosqlite.connect(self.path) as db:
-            db.row_factory = aiosqlite.Row
-            async with db.execute("SELECT * FROM codes WHERE code=?", (code,)) as cur:
-                row = await cur.fetchone()
-                if not row:
-                    return False, None
-                house_id = row["house_id"]
-            
-            # Log code usage for analytics (without blocking reuse)
-            now = datetime.now(timezone.utc).isoformat()
-            await db.execute(
-                "INSERT INTO code_usage(code, user_id, used_at) VALUES(?,?,?)",
-                (code, user_id, now)
-            )
-            await db.commit()
-            
-        await self.upsert_user_access(user_id, days)
-        return True, house_id
-
-    async def load_codes_from_csv(self, csv_path: str):
-        import csv
-        async with aiosqlite.connect(self.path) as db:
-            with open(csv_path, newline='') as f:
-                reader = csv.DictReader(f)
-                for row in reader:
-                    code = int(row["code"])
-                    house_id = row["house_id"].strip()
-                    await db.execute(
-                        "INSERT OR IGNORE INTO codes(code, house_id) VALUES(?,?)",
-                        (code, house_id)
-                    )
             await db.commit()
 
     async def add_photo(self, content_path: str, photo_file: str):
