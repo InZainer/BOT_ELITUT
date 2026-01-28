@@ -263,10 +263,34 @@ async def send_content_with_media(cb: CallbackQuery, db: Database, content_path:
             logger.info(f"send_content_with_media: {media_type} found, sending with caption")
             try:
                 input_file = FSInputFile(media_path)
-                if media_type == 'video':
-                    await cb.message.answer_video(input_file, caption=text_content, parse_mode=parse_mode, reply_markup=reply_markup)
+                
+                # Check caption length limit (1024 chars for captions)
+                # Leaving some buffer, using 1000
+                if len(text_content) > 1000:
+                    logger.info(f"send_content_with_media: text content length {len(text_content)} > 1000, sending media and text separately")
+                    # Send media without caption first
+                    if media_type == 'video':
+                        media_msg = await cb.message.answer_video(input_file)
+                    else:
+                        media_msg = await cb.message.answer_photo(input_file)
+                    
+                    # Inject delete action into callback data of the keyboard
+                    if reply_markup and hasattr(reply_markup, 'inline_keyboard'):
+                        suffix = f"|del:{media_msg.message_id}"
+                        for row in reply_markup.inline_keyboard:
+                            for btn in row:
+                                # Ensure we don't exceed the limit
+                                if btn.callback_data and len(btn.callback_data) + len(suffix) <= 64:
+                                    btn.callback_data += suffix
+
+                    # Send text as separate message with the markup
+                    await cb.message.answer(text_content, parse_mode=parse_mode, reply_markup=reply_markup)
                 else:
-                    await cb.message.answer_photo(input_file, caption=text_content, parse_mode=parse_mode, reply_markup=reply_markup)
+                    if media_type == 'video':
+                        await cb.message.answer_video(input_file, caption=text_content, parse_mode=parse_mode, reply_markup=reply_markup)
+                    else:
+                        await cb.message.answer_photo(input_file, caption=text_content, parse_mode=parse_mode, reply_markup=reply_markup)
+                
                 await cb.message.delete()
                 logger.info(f"send_content_with_media: {media_type} sent successfully")
                 return
@@ -503,6 +527,18 @@ async def handle_concierge_media(message: Message, state: FSMContext):
 
 async def callback_router(cb: CallbackQuery, state: FSMContext, db: Database):
     data = cb.data or ""
+    
+    # Handle auto-delete of associated media messages
+    if "|del:" in data:
+        real_data, msg_id_str = data.split("|del:", 1)
+        data = real_data
+        try:
+            # Delete the linked media message
+            if msg_id_str.isdigit() and cb.message:
+                await cb.message.bot.delete_message(chat_id=cb.message.chat.id, message_id=int(msg_id_str))
+        except Exception as e:
+            logger.warning(f"Failed to delete associated media message {msg_id_str}: {e}")
+
     house = get_house_cached(HOUSE_ID)
 
     # Admin panel callbacks
@@ -966,6 +1002,7 @@ async def admin_router(message: Message, db: Database):
         return False  # Continue to other handlers
 
     txt = (message.text or "").strip()
+    logger.info(f"admin_router: processing message from admin {user.id}, txt='{txt[:50] if txt else 'NO TEXT'}', has_photo={bool(message.photo)}, has_video={bool(message.video)}")
 
     # If admin is replying to a user (pending target)
     target = ADMIN_REPLY_TARGET.get(user.id)
@@ -982,7 +1019,7 @@ async def admin_router(message: Message, db: Database):
             await message.answer(f"Отправлено пользователю {target}")
         finally:
             ADMIN_REPLY_TARGET.pop(user.id, None)
-        return
+        return True
 
     # Admin commands
     if txt == "/admin" or txt == "/admin_menu":
@@ -1030,7 +1067,7 @@ async def admin_router(message: Message, db: Database):
             [InlineKeyboardButton(text="📁 Список файлов", callback_data="admin_ls")],
         ])
         await message.answer(help_text, parse_mode=None, reply_markup=kb)
-        return
+        return True
 
     if txt.startswith("/put "):
         rel_path = txt.split(" ", 1)[1].strip()
@@ -1045,10 +1082,10 @@ async def admin_router(message: Message, db: Database):
             preview = current_content[:300] + ('...' if len(current_content) > 300 else '')
             status = f"⚙️ Редактирование файла: {rel_path}\n\n📄 Текущий контент:\n{preview}\n\n📝 Отправьте новый текст (одним сообщением):"
         else:
-            status = f"➕ Создание нового файла: {rel_path}\n\n📝 Отправьте содержимое (одним сообщением):"
+            status = f"➡️ Создание нового файла: {rel_path}\n\n📝 Отправьте содержимое (одним сообщением):"
             
         await message.answer(status, parse_mode=None)
-        return
+        return True
 
     if txt == "/ls":
         # list common files
@@ -1069,29 +1106,39 @@ async def admin_router(message: Message, db: Database):
             response = f"⚠️ Нет файлов в доме {HOUSE_ID}"
         
         await message.answer(response, parse_mode=None)
-        return
+        return True
 
     if txt.startswith("/photo "):
-        content_path = txt.split(" ", 1)[1].strip()
+        parts = txt.split(" ", 1)
+        if len(parts) < 2:
+            await message.answer("❌ Неверный формат. Используйте: `/photo <путь>`\nПример: `/photo guides/sauna.md`", parse_mode=None)
+            return True
+        content_path = parts[1].strip()
         ADMIN_PHOTO_PENDING[user.id] = content_path
+        logger.info(f"Admin {user.id} initiated photo upload for {content_path}")
         await message.answer(
             f"📷 Добавление фото для: {content_path}\n\n"
             f"📤 Отправьте фотографию следующим сообщением.\n"
             f"💡 Если фото уже существует, оно будет заменено.",
             parse_mode=None
         )
-        return
+        return True
 
     if txt.startswith("/video "):
-        content_path = txt.split(" ", 1)[1].strip()
+        parts = txt.split(" ", 1)
+        if len(parts) < 2:
+            await message.answer("❌ Неверный формат. Используйте: `/video <путь>`\nПример: `/video guides/sauna.md`", parse_mode=None)
+            return True
+        content_path = parts[1].strip()
         ADMIN_VIDEO_PENDING[user.id] = content_path
+        logger.info(f"Admin {user.id} initiated video upload for {content_path}")
         await message.answer(
             f"🎥 Добавление видео для: {content_path}\n\n"
             f"📤 Отправьте видео следующим сообщением.\n"
             f"💡 Если видео уже существует, оно будет заменено.",
             parse_mode=None
         )
-        return
+        return True
 
     if txt.startswith("/delpic "):
         content_path = txt.split(" ", 1)[1].strip()
@@ -1132,7 +1179,7 @@ async def admin_router(message: Message, db: Database):
                 f"🔍 К этому контенту не привязано медиа.",
                 parse_mode=None
             )
-        return
+        return True
 
     # If pending edit path and admin sends text
     pending = ADMIN_EDIT_PENDING.get(user.id)
@@ -1154,15 +1201,16 @@ async def admin_router(message: Message, db: Database):
             f"✅ **Файл успешно обновлён!**\n\n"
             f"📄 Файл: `{rel}`\n"
             f"📊 Размер: {file_size} байт\n"
-            f"⚙️ Изменения применены немедленно!",
+            f"⚠️ Изменения применены немедленно!",
             parse_mode=None
         )
-        return
+        return True
 
     # If pending photo and admin sends photo
     if message.photo and user.id in ADMIN_PHOTO_PENDING:
         content_path = ADMIN_PHOTO_PENDING[user.id]
         photo = message.photo[-1]  # Get highest resolution
+        logger.info(f"Admin {user.id} uploading photo for {content_path}, file_id={photo.file_id}")
         
         try:
             # Download the photo
@@ -1206,12 +1254,13 @@ async def admin_router(message: Message, db: Database):
                 f"Ошибка: {str(e)}",
                 parse_mode=None
             )
-        return
+        return True
 
     # If pending video and admin sends video
     if message.video and user.id in ADMIN_VIDEO_PENDING:
         content_path = ADMIN_VIDEO_PENDING[user.id]
         video = message.video
+        logger.info(f"Admin {user.id} uploading video for {content_path}, file_id={video.file_id}")
         
         try:
             # Download the video
@@ -1255,7 +1304,7 @@ async def admin_router(message: Message, db: Database):
                 f"Ошибка: {str(e)}",
                 parse_mode=None
             )
-        return
+        return True
 
     # Permission management commands
     if txt.startswith("/grant "):
@@ -1279,7 +1328,7 @@ async def admin_router(message: Message, db: Database):
                 await message.answer("❌ Ошибка при выдаче доступа.", parse_mode=None)
         except ValueError:
             await message.answer("❌ Неверный формат user_id. Должно быть число.", parse_mode=None)
-        return
+        return True
 
     if txt.startswith("/revoke "):
         parts = txt.split(" ", 2)
@@ -1302,7 +1351,7 @@ async def admin_router(message: Message, db: Database):
                 await message.answer("⚠️ Доступ не найден или уже отозван.", parse_mode=None)
         except ValueError:
             await message.answer("❌ Неверный формат user_id. Должно быть число.", parse_mode=None)
-        return
+        return True
 
     if txt.startswith("/permissions "):
         parts = txt.split(" ", 1)
@@ -1322,7 +1371,11 @@ async def admin_router(message: Message, db: Database):
                 await message.answer(f"📋 У пользователя {target_user_id} нет специальных разрешений.", parse_mode=None)
         except ValueError:
             await message.answer("❌ Неверный формат user_id. Должно быть число.", parse_mode=None)
-        return
+        return True
+    
+    # No recognized command - return False to allow other handlers
+    logger.info(f"admin_router: no recognized command from admin {user.id}")
+    return False
 
 
 async def main():
